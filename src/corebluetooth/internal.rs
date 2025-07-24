@@ -14,7 +14,7 @@ use super::{
     future::{BtlePlugFuture, BtlePlugFutureStateShared},
     utils::{
         core_bluetooth::{cbuuid_to_uuid, uuid_to_cbuuid},
-        nsuuid_to_uuid,
+        nsuuid_to_uuid, uuid_to_nsuuid,
     },
 };
 use crate::api::{CharPropFlags, Characteristic, Descriptor, ScanFilter, Service, WriteType};
@@ -150,6 +150,7 @@ pub enum CoreBluetoothReply {
     ReadResult(Vec<u8>),
     Connected(BTreeSet<Service>),
     State(CBPeripheralState),
+    Peripheral(bool), // true if peripheral was found, false if not
     Ok,
     Err(String),
 }
@@ -399,6 +400,10 @@ pub enum CoreBluetoothMessage {
         filter: ScanFilter,
     },
     StopScanning,
+    RetrievePeripheral {
+        peripheral_uuid: Uuid,
+        future: CoreBluetoothReplyStateShared,
+    },
     ConnectDevice {
         peripheral_uuid: Uuid,
         future: CoreBluetoothReplyStateShared,
@@ -872,6 +877,70 @@ impl CoreBluetoothInternal {
         }
     }
 
+    fn retrieve_peripheral(&mut self, peripheral_uuid: Uuid, fut: CoreBluetoothReplyStateShared) {
+        trace!("Attempting to retrieve peripheral with UUID: {}", peripheral_uuid);
+        
+        // Check if we already have this peripheral
+        if self.peripherals.contains_key(&peripheral_uuid) {
+            trace!("Peripheral already exists in cache");
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::Peripheral(true));
+            return;
+        }
+
+        // Convert UUID to NSUUID
+        let nsuuid = match uuid_to_nsuuid(peripheral_uuid) {
+            Some(uuid) => uuid,
+            None => {
+                trace!("Failed to create NSUUID from UUID: {}", peripheral_uuid);
+                fut.lock().unwrap().set_reply(CoreBluetoothReply::Peripheral(false));
+                return;
+            }
+        };
+
+        // Create NSArray with the single UUID
+        let uuid_array = NSArray::from_vec(vec![nsuuid]);
+
+        // Call retrievePeripheralsWithIdentifiers
+        let retrieved_peripherals = unsafe { 
+            self.manager.retrievePeripheralsWithIdentifiers(&uuid_array)
+        };
+
+        if retrieved_peripherals.len() > 0 {
+            let peripheral = &retrieved_peripherals[0];
+            let retrieved_uuid = nsuuid_to_uuid(unsafe { &peripheral.identifier() });
+            
+            trace!("Successfully retrieved peripheral: {}", retrieved_uuid);
+            
+            // Send a discovered peripheral event to add it to the AdapterManager
+            let name = unsafe { peripheral.name() }.map(|n| n.to_string());
+            let (event_sender, event_receiver) = mpsc::channel(256);
+            
+            // Add the peripheral to our internal tracking
+            let peripheral_internal = PeripheralInternal {
+                peripheral: peripheral.retain(),
+                connected_future_state: None,
+                disconnected_future_state: None,
+                services: HashMap::new(),
+                event_sender,
+            };
+            
+            self.peripherals.insert(peripheral_uuid, peripheral_internal);
+            
+            if let Err(e) = self.event_sender.try_send(CoreBluetoothEvent::DeviceDiscovered {
+                uuid: peripheral_uuid,
+                name,
+                event_receiver,
+            }) {
+                error!("Failed to send DeviceDiscovered event: {}", e);
+            }
+            
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::Peripheral(true));
+        } else {
+            trace!("No peripheral found with UUID: {}", peripheral_uuid);
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::Peripheral(false));
+        }
+    }
+
     fn write_value(
         &mut self,
         peripheral_uuid: Uuid,
@@ -1169,6 +1238,9 @@ impl CoreBluetoothInternal {
                     },
                     CoreBluetoothMessage::StartScanning{filter} => self.start_discovery(filter),
                     CoreBluetoothMessage::StopScanning => self.stop_discovery(),
+                    CoreBluetoothMessage::RetrievePeripheral{peripheral_uuid, future} => {
+                        self.retrieve_peripheral(peripheral_uuid, future);
+                    }
                     CoreBluetoothMessage::ConnectDevice{peripheral_uuid, future} => {
                         trace!("got connectdevice msg!");
                         self.connect_peripheral(peripheral_uuid, future);

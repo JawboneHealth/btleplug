@@ -15,6 +15,7 @@ use objc2_core_bluetooth::CBManagerState;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task;
+use uuid::Uuid;
 
 /// Implementation of [api::Central](crate::api::Central).
 #[derive(Clone, Debug)]
@@ -126,10 +127,47 @@ impl Central for Adapter {
         self.manager.peripheral(id).ok_or(Error::DeviceNotFound)
     }
 
-    async fn add_peripheral(&self, _address: &PeripheralId) -> Result<Peripheral> {
-        Err(Error::NotSupported(
-            "Can't add a Peripheral from a PeripheralId".to_string(),
-        ))
+    async fn add_peripheral(&self, address: &PeripheralId) -> Result<Peripheral> {
+        // Parse the UUID from the PeripheralId's Display implementation
+        let peripheral_uuid = Uuid::parse_str(&address.to_string())
+            .map_err(|e| Error::Other(format!("Invalid UUID: {}", e).into()))?;
+        
+        // Check if we already have this peripheral
+        if let Some(existing_peripheral) = self.manager.peripheral(address) {
+            return Ok(existing_peripheral);
+        }
+
+        // Try to retrieve the peripheral from macOS
+        let fut = CoreBluetoothReplyFuture::default();
+        self.sender
+            .to_owned()
+            .send(CoreBluetoothMessage::RetrievePeripheral {
+                peripheral_uuid,
+                future: fut.get_state_clone(),
+            })
+            .await?;
+
+        match fut.await {
+            CoreBluetoothReply::Peripheral(found) => {
+                if found {
+                    // Give a brief moment for the DeviceDiscovered event to be processed
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    
+                    // Try to get the peripheral from the manager
+                    if let Some(peripheral) = self.manager.peripheral(address) {
+                        Ok(peripheral)
+                    } else {
+                        // If still not available, it means the event processing hasn't completed
+                        Err(Error::Other(
+                            "Peripheral found but not yet fully available. Try again after scanning.".to_string().into(),
+                        ))
+                    }
+                } else {
+                    Err(Error::DeviceNotFound)
+                }
+            }
+            _ => Err(Error::Other("Unexpected reply from CoreBluetooth".to_string().into())),
+        }
     }
 
     async fn adapter_info(&self) -> Result<String> {
